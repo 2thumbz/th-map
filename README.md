@@ -1,4 +1,4 @@
-# my_nav_app
+# TH MAP
 
 로컬 DB(오프라인)와 백엔드(DB/API) 모드를 모두 지원하는 Flutter 경로 안내 앱입니다.
 
@@ -12,7 +12,6 @@
 
 ### 1.2 검색/목적지 선택
 
-- 지명 검색(Kakao Local Search)
 - 노드 ID 검색(SQLite 또는 PostgreSQL 제안)
 - 좌표 직접 입력 검색(`lat,lng`)
 - 지도 길게 누르기(long press)로 목적지 설정
@@ -77,9 +76,6 @@ flutter run \
 
 # 온라인 타일 강제(디버깅)
 flutter run --dart-define=OFFLINE_MAP_TILES=false
-
-# 카카오 지명 검색 키 설정
-flutter run --dart-define=KAKAO_REST_API_KEY=YOUR_REST_API_KEY
 ```
 
 ### 3.2 지원 설정 키
@@ -87,7 +83,6 @@ flutter run --dart-define=KAKAO_REST_API_KEY=YOUR_REST_API_KEY
 - `ENABLE_BACKEND` : 백엔드 모드 사용 여부 (`true/false`)
 - `API_BASE_URL` : 백엔드 API 기본 URL
 - `OFFLINE_MAP_TILES` : 오프라인 타일 우선 여부 (`true/false`)
-- `KAKAO_REST_API_KEY` : 지명 검색 API 키
 
 ## 4. 오프라인 자원 구성
 
@@ -179,7 +174,7 @@ flutter build apk
 - 상단: 목적지 검색 패널
 - 우측 상단: 다음 회전 안내 카드
 - 좌측 하단: 실시간 속도 카드
-- 하단: 현재위치/경로계산/내비 시작·정지 + 상태 배지
+- 하단: 현재위치/내비 시작·정지 + 상태 배지
 
 ## 9. 주의/운영 팁
 

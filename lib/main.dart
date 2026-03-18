@@ -17,7 +17,6 @@ import 'navigation/nav_engine.dart';
 import 'navigation/navigation_math.dart';
 import 'navigation/route_visualization.dart';
 import 'postgresql_helper.dart';
-import 'place_search_helper.dart';
 import 'widgets/maneuver_guidance_card.dart';
 import 'widgets/navigation_bottom_panel.dart';
 
@@ -94,7 +93,6 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
   // 외부 의존성/헬퍼
   final DatabaseHelper _dbHelper = DatabaseHelper();
   late PostgresqlHelper? _pgHelper;
-  final PlaceSearchHelper _placeSearchHelper = PlaceSearchHelper();
 
   // 지도/경로/주행 상태
   Map<int, Node> _nodes = {};
@@ -1222,7 +1220,6 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
 
   // 통합 검색 처리:
   // - lat,lng 직접 입력
-  // - 지명 검색(Kakao)
   // - 노드 검색
   Future<void> _submitSearch([String? value]) async {
     final query = (value ?? _searchController.text).trim();
@@ -1246,62 +1243,6 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
         _selectDestination(nearest);
       }
       return;
-    }
-
-    // Try real place-name search first, then map each result to the nearest graph node.
-    final placeResults = await _placeSearchHelper.searchPlace(query, limit: 3);
-    if (placeResults.isNotEmpty) {
-      final suggestions = <NodeSearchSuggestion>[];
-      final seenNodeIds = <int>{};
-
-      for (int i = 0; i < placeResults.length; i++) {
-        final place = placeResults[i];
-        Node? nearest = _usePostgreSQL && _pgHelper != null
-            ? await _pgHelper!.findNearestNode(place.location)
-            : _findNearestNodeLocal(place.location);
-
-        if (nearest == null) continue;
-        if (seenNodeIds.contains(nearest.id)) continue;
-
-        seenNodeIds.add(nearest.id);
-        suggestions.add(
-          NodeSearchSuggestion(
-            node: nearest,
-            label: place.displayName,
-            score: 100 - i.toDouble(),
-          ),
-        );
-      }
-
-      if (suggestions.isNotEmpty) {
-        final etaMap = <int, double?>{};
-        final linearMap = <int, double>{};
-        for (final suggestion in suggestions.take(8)) {
-          etaMap[suggestion.node.id] = _estimateMinutesToNode(suggestion.node);
-          linearMap[suggestion.node.id] = _estimateLinearKmToNode(
-            suggestion.node,
-          );
-        }
-
-        setState(() {
-          _searchResults = suggestions;
-          _etaMinutesByNode = etaMap;
-          _linearKmByNode = linearMap;
-        });
-
-        _moveMapTo(placeResults.first.location, zoom: math.max(_mapZoom, 17));
-
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(
-                '지명 검색 결과 ${suggestions.length}건입니다. 목록에서 선택해 주세요.',
-              ),
-            ),
-          );
-        }
-        return;
-      }
     }
 
     await _searchDestination(query);
@@ -1740,7 +1681,7 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
                         keyboardType: TextInputType.text,
                         textInputAction: TextInputAction.search,
                         decoration: InputDecoration(
-                          hintText: '목적지 검색 (지명/ID/노드명 또는 lat,lng)',
+                          hintText: '목적지 검색 (ID/노드명 또는 lat,lng)',
                           prefixIcon: const Icon(Icons.search),
                           suffixIcon: Row(
                             mainAxisSize: MainAxisSize.min,
