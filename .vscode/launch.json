@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Flutter (Kakao API)",
+      "request": "launch",
+      "type": "dart",
+      "toolArgs": [
+        "--dart-define=KAKAO_REST_API_KEY=c8d52cb1fcf317f9ee2ae0c30716688b"
+      ]
+    }
+  ]
+}
