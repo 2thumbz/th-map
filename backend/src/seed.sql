@@ -17,3 +17,59 @@ ON CONFLICT (id) DO UPDATE SET
   end_node = EXCLUDED.end_node,
   weight = EXCLUDED.weight,
   road_name = EXCLUDED.road_name;
+
+INSERT INTO TB_TURNINFO (prev_link_id, next_link_id, turn_type, turn_desc)
+SELECT NULL, NULL, '001', '비보호회전'
+WHERE NOT EXISTS (
+  SELECT 1 FROM TB_TURNINFO
+  WHERE prev_link_id IS NULL AND next_link_id IS NULL AND turn_type = '001'
+);
+
+INSERT INTO TB_TURNINFO (prev_link_id, next_link_id, turn_type, turn_desc)
+SELECT NULL, NULL, '002', '버스만회전'
+WHERE NOT EXISTS (
+  SELECT 1 FROM TB_TURNINFO
+  WHERE prev_link_id IS NULL AND next_link_id IS NULL AND turn_type = '002'
+);
+
+INSERT INTO TB_TURNINFO (prev_link_id, next_link_id, turn_type, turn_desc)
+SELECT NULL, NULL, '003', '회전금지'
+WHERE NOT EXISTS (
+  SELECT 1 FROM TB_TURNINFO
+  WHERE prev_link_id IS NULL AND next_link_id IS NULL AND turn_type = '003'
+);
+
+INSERT INTO TB_TURNINFO (prev_link_id, next_link_id, turn_type, turn_desc)
+SELECT NULL, NULL, '011', 'U-TURN'
+WHERE NOT EXISTS (
+  SELECT 1 FROM TB_TURNINFO
+  WHERE prev_link_id IS NULL AND next_link_id IS NULL AND turn_type = '011'
+);
+
+INSERT INTO TB_TURNINFO (prev_link_id, next_link_id, turn_type, turn_desc)
+SELECT NULL, NULL, '012', 'P-TURN'
+WHERE NOT EXISTS (
+  SELECT 1 FROM TB_TURNINFO
+  WHERE prev_link_id IS NULL AND next_link_id IS NULL AND turn_type = '012'
+);
+
+INSERT INTO TB_TURNINFO (prev_link_id, next_link_id, turn_type, turn_desc)
+SELECT NULL, NULL, '101', '좌회전금지'
+WHERE NOT EXISTS (
+  SELECT 1 FROM TB_TURNINFO
+  WHERE prev_link_id IS NULL AND next_link_id IS NULL AND turn_type = '101'
+);
+
+INSERT INTO TB_TURNINFO (prev_link_id, next_link_id, turn_type, turn_desc)
+SELECT NULL, NULL, '102', '직진금지'
+WHERE NOT EXISTS (
+  SELECT 1 FROM TB_TURNINFO
+  WHERE prev_link_id IS NULL AND next_link_id IS NULL AND turn_type = '102'
+);
+
+INSERT INTO TB_TURNINFO (prev_link_id, next_link_id, turn_type, turn_desc)
+SELECT NULL, NULL, '103', '우회전금지'
+WHERE NOT EXISTS (
+  SELECT 1 FROM TB_TURNINFO
+  WHERE prev_link_id IS NULL AND next_link_id IS NULL AND turn_type = '103'
+);

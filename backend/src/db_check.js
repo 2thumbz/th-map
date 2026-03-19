@@ -8,7 +8,7 @@ async function main() {
     console.log('db_ping', ping.rows);
 
     const tables = await pool.query(
-      "select table_name from information_schema.tables where table_schema='public' and table_name in ('nodes','links') order by table_name"
+      "select table_name from information_schema.tables where table_schema='public' and table_name in ('nodes','links','tb_turninfo') order by table_name"
     );
     console.log('tables', tables.rows);
   } catch (e) {

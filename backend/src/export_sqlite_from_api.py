@@ -100,6 +100,34 @@ def _normalize_links(links: list[dict], valid_node_ids: set[int]) -> list[tuple[
     return normalized
 
 
+def _seed_turn_type_dictionary(conn: sqlite3.Connection) -> None:
+    turn_type_codes = [
+        ("001", "비보호회전"),
+        ("002", "버스만회전"),
+        ("003", "회전금지"),
+        ("011", "U-TURN"),
+        ("012", "P-TURN"),
+        ("101", "좌회전금지"),
+        ("102", "직진금지"),
+        ("103", "우회전금지"),
+    ]
+
+    for turn_type, turn_desc in turn_type_codes:
+        conn.execute(
+            """
+            INSERT INTO TB_TURNINFO (PREV_LINK_ID, NEXT_LINK_ID, TURN_TYPE, TURN_DESC)
+            SELECT NULL, NULL, ?, ?
+            WHERE NOT EXISTS (
+              SELECT 1 FROM TB_TURNINFO
+              WHERE PREV_LINK_ID IS NULL
+                AND NEXT_LINK_ID IS NULL
+                AND TURN_TYPE = ?
+            )
+            """,
+            (turn_type, turn_desc, turn_type),
+        )
+
+
 def build_sqlite(
     db_path: Path,
     node_rows: list[tuple[int, str | None, float, float]],
@@ -138,10 +166,16 @@ def build_sqlite(
             """
         )
 
-        conn.executemany(
-            "INSERT INTO nodes (id, name, latitude, longitude) VALUES (?, ?, ?, ?)",
-            node_rows,
-        )
+                conn.execute(
+                        """
+                        CREATE TABLE TB_TURNINFO (
+                            ID INTEGER PRIMARY KEY AUTOINCREMENT,
+                            PREV_LINK_ID INTEGER,
+                            NEXT_LINK_ID INTEGER,
+                            TURN_TYPE TEXT NOT NULL,
+                            TURN_DESC TEXT,
+              FOREIGN KEY(PREV_LINK_ID) REFERENCES links(id) ON DELETE RESTRICT,
+              FOREIGN KEY(NEXT_LINK_ID) REFERENCES links(id) ON DELETE RESTRICT
         conn.executemany(
             "INSERT INTO links (id, start_node, end_node, weight, road_name) VALUES (?, ?, ?, ?, ?)",
             link_rows,
@@ -150,9 +184,22 @@ def build_sqlite(
         conn.execute("CREATE INDEX idx_links_start_node ON links(start_node)")
         conn.execute("CREATE INDEX idx_links_end_node ON links(end_node)")
         conn.execute("CREATE INDEX idx_nodes_name ON nodes(name)")
+        conn.execute(
+            "CREATE INDEX idx_turninfo_prev_next ON TB_TURNINFO(PREV_LINK_ID, NEXT_LINK_ID)"
+        )
+        conn.execute("CREATE INDEX idx_turninfo_type ON TB_TURNINFO(TURN_TYPE)")
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX uq_turninfo_transition
+            ON TB_TURNINFO(PREV_LINK_ID, NEXT_LINK_ID)
+            WHERE PREV_LINK_ID IS NOT NULL AND NEXT_LINK_ID IS NOT NULL
+            """
+        )
 
-        # user_version=2: 노드 name 컬럼 포함 버전
-        conn.execute("PRAGMA user_version = 2")
+        _seed_turn_type_dictionary(conn)
+
+        # user_version=3: TB_TURNINFO 테이블 + FK ON DELETE RESTRICT 버전
+        conn.execute("PRAGMA user_version = 3")
         # WAL 파일 없이 단일 파일로 배포 가능하게 journal_mode=DELETE 설정
         conn.execute("PRAGMA journal_mode = DELETE")
 

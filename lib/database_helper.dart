@@ -78,14 +78,70 @@ class Link {
   }
 }
 
+class TurnInfo {
+  final int? id;
+  final int? prevLinkId;
+  final int? nextLinkId;
+  final String turnType;
+  final String? description;
+
+  const TurnInfo({
+    this.id,
+    this.prevLinkId,
+    this.nextLinkId,
+    required this.turnType,
+    this.description,
+  });
+
+  bool get hasTransition => prevLinkId != null && nextLinkId != null;
+
+  factory TurnInfo.fromMap(Map<String, dynamic> map) {
+    int? parseInt(dynamic value) {
+      if (value == null) return null;
+      if (value is int) return value;
+      return int.tryParse(value.toString());
+    }
+
+    final turnTypeRaw =
+        map['TURN_TYPE'] ?? map['turn_type'] ?? map['turnType'] ?? '';
+    final turnType = turnTypeRaw.toString().trim();
+
+    final descriptionRaw =
+        map['TURN_DESC'] ?? map['turn_desc'] ?? map['description'];
+    final parsedDescription = descriptionRaw?.toString().trim();
+
+    return TurnInfo(
+      id: parseInt(map['ID'] ?? map['id']),
+      prevLinkId: parseInt(
+        map['PREV_LINK_ID'] ??
+            map['prev_link_id'] ??
+            map['IN_LINK_ID'] ??
+            map['in_link_id'],
+      ),
+      nextLinkId: parseInt(
+        map['NEXT_LINK_ID'] ??
+            map['next_link_id'] ??
+            map['OUT_LINK_ID'] ??
+            map['out_link_id'],
+      ),
+      turnType: turnType,
+      description: parsedDescription == null || parsedDescription.isEmpty
+          ? null
+          : parsedDescription,
+    );
+  }
+}
+
 class DatabaseHelper {
   static const String _nodeName = 'nodes';
   static const String _linkName = 'links';
+  static const String _turnInfoName = 'TB_TURNINFO';
   static const String _bundledDatabaseAsset = 'assets/db/nav_database.db';
   static Database? _database;
 
   // 번들 DB의 논리적 버전. export 스크립트의 PRAGMA user_version 과 맞춰야 한다.
-  static const int _bundledDataVersion = 2;
+  // v3: TB_TURNINFO 테이블 추가 + FK ON DELETE RESTRICT 적용
+  static const int _bundledDataVersion = 3;
   // 유효 데이터로 간주할 최소 노드 수 (4개 더미 노드는 스킵)
   static const int _minRequiredNodes = 100;
 
@@ -144,6 +200,113 @@ class DatabaseHelper {
     ''');
     await db.execute(
       'CREATE INDEX IF NOT EXISTS idx_nodes_name ON $_nodeName(name)',
+    );
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS $_turnInfoName (
+        ID INTEGER PRIMARY KEY AUTOINCREMENT,
+        PREV_LINK_ID INTEGER,
+        NEXT_LINK_ID INTEGER,
+        TURN_TYPE TEXT NOT NULL,
+        TURN_DESC TEXT,
+        FOREIGN KEY(PREV_LINK_ID) REFERENCES $_linkName(id) ON DELETE RESTRICT,
+        FOREIGN KEY(NEXT_LINK_ID) REFERENCES $_linkName(id) ON DELETE RESTRICT
+      )
+    ''');
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_turninfo_prev_next ON $_turnInfoName(PREV_LINK_ID, NEXT_LINK_ID)',
+    );
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_turninfo_type ON $_turnInfoName(TURN_TYPE)',
+    );
+    await _seedTurnTypeCodes(db);
+    await _cleanupInvalidTurnInfoTransitions(db);
+    await db.execute(
+      'CREATE UNIQUE INDEX IF NOT EXISTS uq_turninfo_transition ON $_turnInfoName(PREV_LINK_ID, NEXT_LINK_ID) WHERE PREV_LINK_ID IS NOT NULL AND NEXT_LINK_ID IS NOT NULL',
+    );
+  }
+
+  Future<void> _seedTurnTypeCodes(Database db) async {
+    const turnTypeCodes = [
+      ('001', '비보호회전'),
+      ('002', '버스만회전'),
+      ('003', '회전금지'),
+      ('011', 'U-TURN'),
+      ('012', 'P-TURN'),
+      ('101', '좌회전금지'),
+      ('102', '직진금지'),
+      ('103', '우회전금지'),
+    ];
+
+    for (final item in turnTypeCodes) {
+      await db.rawInsert(
+        '''
+        INSERT INTO $_turnInfoName (TURN_TYPE, TURN_DESC)
+        SELECT ?, ?
+        WHERE NOT EXISTS (
+          SELECT 1 FROM $_turnInfoName
+          WHERE TURN_TYPE = ?
+          AND PREV_LINK_ID IS NULL
+          AND NEXT_LINK_ID IS NULL
+        )
+        ''',
+        [item.$1, item.$2, item.$1],
+      );
+    }
+  }
+
+  Future<void> _cleanupInvalidTurnInfoTransitions(Database db) async {
+    final hasTurnInfo =
+        Sqflite.firstIntValue(
+          await db.rawQuery(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+            [_turnInfoName],
+          ),
+        ) ??
+        0;
+    if (hasTurnInfo == 0) return;
+
+    // 동일 전이쌍이 여러 개면 가장 작은 ID 1건만 남긴다.
+    await db.delete(
+      _turnInfoName,
+      where:
+          '''
+        PREV_LINK_ID IS NOT NULL AND NEXT_LINK_ID IS NOT NULL
+        AND ID NOT IN (
+          SELECT MIN(ID)
+          FROM $_turnInfoName
+          WHERE PREV_LINK_ID IS NOT NULL AND NEXT_LINK_ID IS NOT NULL
+          GROUP BY PREV_LINK_ID, NEXT_LINK_ID
+        )
+      ''',
+    );
+
+    // 전이행인데 링크가 없는 고아 레코드는 제거한다.
+    await db.delete(
+      _turnInfoName,
+      where:
+          '''
+        PREV_LINK_ID IS NOT NULL AND NEXT_LINK_ID IS NOT NULL
+        AND (
+          PREV_LINK_ID NOT IN (SELECT id FROM $_linkName)
+          OR NEXT_LINK_ID NOT IN (SELECT id FROM $_linkName)
+        )
+      ''',
+    );
+
+    // 진입 링크의 end_node 와 진출 링크의 start_node 가 다르면 교차로 전이가 아니다.
+    await db.delete(
+      _turnInfoName,
+      where:
+          '''
+        PREV_LINK_ID IS NOT NULL AND NEXT_LINK_ID IS NOT NULL
+        AND EXISTS (
+          SELECT 1
+          FROM $_linkName prev
+          JOIN $_linkName next ON next.id = $_turnInfoName.NEXT_LINK_ID
+          WHERE prev.id = $_turnInfoName.PREV_LINK_ID
+          AND prev.end_node != next.start_node
+        )
+      ''',
     );
   }
 
@@ -278,6 +441,32 @@ class DatabaseHelper {
     final db = await database;
     final List<Map<String, dynamic>> maps = await db.query(_linkName);
     return [for (var item in maps) Link.fromMap(item)];
+  }
+
+  // 회전정보 조회 (실제 전이 정보가 있는 레코드만 반환)
+  Future<List<TurnInfo>> getAllTurnInfos() async {
+    final db = await database;
+
+    final hasTable =
+        Sqflite.firstIntValue(
+          await db.rawQuery(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+            [_turnInfoName],
+          ),
+        ) ??
+        0;
+    if (hasTable == 0) {
+      return [];
+    }
+
+    final maps = await db.query(
+      _turnInfoName,
+      where: 'PREV_LINK_ID IS NOT NULL AND NEXT_LINK_ID IS NOT NULL',
+    );
+    return maps
+        .map(TurnInfo.fromMap)
+        .where((item) => item.turnType.isNotEmpty && item.hasTransition)
+        .toList();
   }
 
   // 노드 추가

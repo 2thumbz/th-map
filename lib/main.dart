@@ -97,6 +97,7 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
   // 지도/경로/주행 상태
   Map<int, Node> _nodes = {};
   List<Link> _links = [];
+  List<TurnInfo> _turnInfos = [];
   List<Node> _currentPath = [];
   final MapController _mapController = MapController();
   LatLng _currentLocation = _gwacheonDTechTower;
@@ -405,17 +406,20 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
   }
 
   // 로컬 DB가 비어 있으면 자동 복구를 시도한 뒤 데이터를 다시 읽는다.
-  Future<(Map<int, Node>, List<Link>)> _loadLocalDataWithRepair() async {
+  Future<(Map<int, Node>, List<Link>, List<TurnInfo>)>
+  _loadLocalDataWithRepair() async {
     var nodes = await _dbHelper.getAllNodes();
     var links = await _dbHelper.getAllLinks();
+    var turnInfos = await _dbHelper.getAllTurnInfos();
 
     if (nodes.isEmpty || links.isEmpty) {
       await _dbHelper.repairDatabaseIfEmpty();
       nodes = await _dbHelper.getAllNodes();
       links = await _dbHelper.getAllLinks();
+      turnInfos = await _dbHelper.getAllTurnInfos();
     }
 
-    return (nodes, links);
+    return (nodes, links, turnInfos);
   }
 
   // 앱 시작 시 데이터 소스를 초기화한다.
@@ -424,11 +428,12 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
   Future<void> _loadData() async {
     try {
       if (!_enableBackend) {
-        final (nodes, links) = await _loadLocalDataWithRepair();
+        final (nodes, links, turnInfos) = await _loadLocalDataWithRepair();
 
         setState(() {
           _nodes = nodes;
           _links = links;
+          _turnInfos = turnInfos;
           _usePostgreSQL = false;
           _currentLocation = _gwacheonDTechTower;
           _currentNode = _findNearestNodeLocal(_gwacheonDTechTower);
@@ -464,6 +469,7 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
           setState(() {
             _nodes = pgNodes;
             _links = pgLinks;
+            _turnInfos = [];
             _usePostgreSQL = true;
             _currentLocation = _gwacheonDTechTower;
             _currentNode =
@@ -477,11 +483,12 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
         appLog('PostgreSQL 연결 실패, 로컬 DB 사용: $e');
 
         // 실패 시 로컬 DB fallback
-        final (nodes, links) = await _loadLocalDataWithRepair();
+        final (nodes, links, turnInfos) = await _loadLocalDataWithRepair();
 
         setState(() {
           _nodes = nodes;
           _links = links;
+          _turnInfos = turnInfos;
           _usePostgreSQL = false;
           _currentLocation = _gwacheonDTechTower;
           _currentNode = _findNearestNodeLocal(_gwacheonDTechTower);
@@ -807,7 +814,7 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
       return _findNearestNodeLocal(location);
     }
 
-    final engine = NavEngine(_nodes, _links);
+    final engine = NavEngine(_nodes, _links, turnInfos: _turnInfos);
     Node? bestNode;
     double bestScore = double.infinity;
 
@@ -1201,7 +1208,7 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
   // 현재 노드 기준 네트워크 경로 거리로 ETA를 추정한다.
   double? _estimateMinutesToNode(Node destination) {
     if (_currentNode == null) return null;
-    final engine = NavEngine(_nodes, _links);
+    final engine = NavEngine(_nodes, _links, turnInfos: _turnInfos);
     final pathInfo = engine.getPathInfo(_currentNode!.id, destination.id);
     final path = pathInfo['path'] as List<Node>;
     if (path.length < 2) return null;
@@ -1375,7 +1382,7 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
       return;
     }
 
-    final engine = NavEngine(_nodes, _links);
+    final engine = NavEngine(_nodes, _links, turnInfos: _turnInfos);
     final pathInfo = engine.getPathInfo(_currentNode!.id, _destinationNode!.id);
 
     setState(() {
