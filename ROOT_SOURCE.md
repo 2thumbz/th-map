@@ -8,7 +8,7 @@
 
 당신은 Flutter 내비게이션 앱 유지보수 시니어 엔지니어다.
 작업 대상은 `c:/nav-app/my_nav_app`이며, 핵심 파일은 `lib/main.dart`다.
-목표는 오프라인 지도 안정성, 재탐색 품질, 안내 정확도, 지도 UX, 시각화, 디바이스 동작 안정성을 실사용 수준으로 개선하는 것이다.
+목표는 오프라인 지도 안정성, 재탐색 품질, 안내 정확도, 지도 UX, 시각화, 디바이스 동작 안정성, 회전 제약 데이터 품질을 실사용 수준으로 개선하는 것이다.
 
 아래 요구사항을 모두 반영해 코드 수정, 패키지 반영, 빌드 검증까지 끝내라.
 
@@ -60,10 +60,39 @@
 ### 9) 문서화
 - `README.md`에 업데이트 로그 섹션을 추가/유지하고, 이번 변경사항을 날짜별로 기록한다.
 
-### 10) 검증/빌드
+### 10) TURNINFO 기반 회전 제약
+- `TB_TURNINFO` 테이블을 기준으로 링크 전이 제약을 반영한다.
+- `PREV_LINK_ID`, `NEXT_LINK_ID`는 모두 `links.id`를 참조해야 한다.
+- 제약 키는 node가 아니라 `(PREV_LINK_ID, NEXT_LINK_ID)` 전이쌍이다.
+- `TURN_TYPE` 금지 코드(`002`, `003`, `101`, `102`, `103`)는 경로 탐색에서 제외한다.
+- 허용 코드(`001`, `011`, `012`)는 통과시킨다.
+- 라우팅 엔진은 이전 링크 상태를 함께 들고 다니도록 구현한다.
+- PostgreSQL 원본 테이블은 앱 SQLite 스키마와 다를 수 있다. 현재 기준 원본 `public."TB_TURNINFO"` 컬럼은 `gid`, `node_id`, `turn_id`, `st_link`, `ed_link`, `turn_type`, `turn_oper`, `remark` 구조다.
+- 원본 `st_link`, `ed_link`는 앱의 `links.id`가 아니라 원천 도로 링크 식별자(`TB_AY_MOCT_LINK.LINK_ID`)이므로, API/export 단계에서 `LINK_ID -> links.id`로 재매핑해서 전달해야 한다.
+- 원본 turninfo 총건수와 앱에 최종 반영되는 유효 전이 수가 다를 수 있다. 링크 미존재, 매핑 실패, 중복 제거, 교차로 불일치가 있으면 일부 전이는 제외해도 된다.
+- 특정 잘못된 회전 안내가 남을 때는 로직을 더 복잡하게 만들기보다 먼저 전이 데이터 부재/누락 여부를 점검하고, 데이터가 없으면 현재 로직을 유지하는 편이 낫다.
+
+### 11) TURNINFO 데이터 검증
+- `TB_TURNINFO`에 전이쌍 유니크 인덱스를 둔다.
+- `PREV_LINK_ID`, `NEXT_LINK_ID`는 `links.id` FK로 연결한다.
+- 고아 링크, 중복 전이, 교차로 불일치(`prev.end_node != next.start_node`)를 정리하거나 리포트로 검출한다.
+- `backend/src/turninfo_report.sql` 같은 검증 SQL을 유지한다.
+- SQLite 번들 DB와 백엔드 스키마가 같은 규칙을 따르도록 맞춘다.
+
+### 13) 내비게이션 카메라/마커 UX
+- 안내 시작 줌은 `_navigationFollowZoomDefault = 16.0`으로 고정한다.
+- 차량 마커 크기는 52x52px(기존 64x64의 약 0.8배).
+- 안내 중 마커 회전은 GPS heading 대신 경로 투영 bearing(`_routeBearingForLocation`)을 우선한다. 투영 실패 시 `_carHeadingDeg`로 fallback.
+- 화면 배치:
+	- 가로: X 오프셋 = 0(중심선 고정)
+	- 세로: `NavigationBottomPanel` 실측 높이를 `GlobalKey`로 읽어 패널 바로 위에 마커가 오도록 Y 오프셋을 매 프레임 동적 계산
+	- 패널 높이 미확보 시 추정값(`_navigationBottomPanelEstimatedHeightPx = 86.0`) 사용
+
+### 12) 검증/빌드
 - `dart format` 적용.
 - 정적 오류를 확인하고 타입 오류(특히 nullable 관련)를 모두 해결.
 - 최종적으로 `flutter build apk` 성공까지 확인.
+- 필요 시 `flutter build apk --debug`까지 확인하고 경고를 정리한다.
 - 산출물 경로와 파일 크기를 결과로 보고.
 
 ## 구현 제약
@@ -80,6 +109,20 @@
 5. 후속 튜닝 포인트(임계값, UX 상수)
 
 ---
+
+## 현재 주요 상수 (2026-03-26 기준)
+
+| 상수 | 값 | 설명 |
+|---|---|---|
+| `_navigationFollowZoomDefault` | `16.0` | 안내 시작 줌 레벨 |
+| `_navigationBottomPanelEstimatedHeightPx` | `86.0` | 하단 패널 추정 높이(실측 전 fallback) |
+| `_navigationMarkerGapAbovePanelPx` | `18.0` | 패널 위 마커 여백 |
+| `_rerouteOffPathThresholdMeters` | `30` | 경로 이탈 재탐색 임계 거리 |
+| `_rerouteOffPathConsecutiveHits` | `2` | 이탈 연속 감지 횟수 |
+| `_destinationArrivalMeters` | `20` | 도착 자동 종료 반경 |
+| `_ttsPreviewFarMeters` | `500` | TTS 미리 안내 거리(원거리) |
+| `_ttsPreviewNearMeters` | `150` | TTS 미리 안내 거리(근거리) |
+| `_ttsNowMeters` | `30` | TTS 즉시 안내 거리 |
 
 ## Quick Use
 

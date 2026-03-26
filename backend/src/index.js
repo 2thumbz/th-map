@@ -62,6 +62,35 @@ app.get('/api/links', async (_req, res) => {
   }
 });
 
+app.get('/api/turninfos', async (_req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        t.gid AS id,
+        prev_link.id AS prev_link_id,
+        next_link.id AS next_link_id,
+        TRIM(t.turn_type::text) AS turn_type,
+        NULLIF(TRIM(COALESCE(t.remark, '')), '') AS turn_desc
+      FROM public."TB_TURNINFO" t
+      JOIN public."TB_AY_MOCT_LINK" prev_link
+        ON TRIM(COALESCE(prev_link."LINK_ID", '')) = TRIM(COALESCE(t.st_link::text, ''))
+      JOIN public."TB_AY_MOCT_LINK" next_link
+        ON TRIM(COALESCE(next_link."LINK_ID", '')) = TRIM(COALESCE(t.ed_link::text, ''))
+      WHERE t.st_link IS NOT NULL
+        AND t.ed_link IS NOT NULL
+      ORDER BY t.gid ASC
+      `
+    );
+    return res.json(result.rows);
+  } catch (error) {
+    if (error && error.code === '42P01') {
+      return res.json([]);
+    }
+    return res.status(500).json({ error: 'failed_to_fetch_turninfos' });
+  }
+});
+
 app.get('/api/nodes/search', async (req, res) => {
   const q = String(req.query.q || '').trim();
   if (!q) {

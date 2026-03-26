@@ -43,6 +43,7 @@ dependencies:
   http: ^1.1.0         # HTTP 요청 (REST API용)
   geolocator: ^14.0.2  # 현재 위치(GPS)
   wakelock_plus: ^1.5.1
+  flutter_tts: ^4.2.2
 
 dev_dependencies:
   flutter_test:

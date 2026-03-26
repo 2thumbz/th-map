@@ -140,8 +140,8 @@ class DatabaseHelper {
   static Database? _database;
 
   // 번들 DB의 논리적 버전. export 스크립트의 PRAGMA user_version 과 맞춰야 한다.
-  // v3: TB_TURNINFO 테이블 추가 + FK ON DELETE RESTRICT 적용
-  static const int _bundledDataVersion = 3;
+  // v6: 최신 Node/Link/TurnInfo 번들 데이터 강제 교체
+  static const int _bundledDataVersion = 6;
   // 유효 데이터로 간주할 최소 노드 수 (4개 더미 노드는 스킵)
   static const int _minRequiredNodes = 100;
 

@@ -25,7 +25,7 @@ class ManeuverGuidanceCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final subtitle = nextManeuver != null
-        ? '${distanceToManeuverMeters.toStringAsFixed(0)}m 후 ${nextManeuver!.roadName}'
+        ? '${_formatDistance(distanceToManeuverMeters)} 후 ${nextManeuver!.roadName}'
         : '목적지까지 ${_formatDistance(remainingDistanceMeters)}';
 
     return Card(

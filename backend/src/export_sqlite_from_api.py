@@ -100,6 +100,44 @@ def _normalize_links(links: list[dict], valid_node_ids: set[int]) -> list[tuple[
     return normalized
 
 
+def _normalize_turninfos(
+    turninfos: list[dict], valid_link_ids: set[int]
+) -> list[tuple[int | None, int, int, str, str | None]]:
+    normalized: list[tuple[int | None, int, int, str, str | None]] = []
+    seen_pairs: set[tuple[int, int]] = set()
+
+    for index, item in enumerate(turninfos, start=1):
+        try:
+            prev_link_id = int(item["prev_link_id"])
+            next_link_id = int(item["next_link_id"])
+            turn_type = str(item["turn_type"]).strip()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Invalid turninfo at index {index}: required fields are prev_link_id, next_link_id, turn_type"
+            ) from exc
+
+        if prev_link_id not in valid_link_ids or next_link_id not in valid_link_ids:
+            continue
+
+        pair = (prev_link_id, next_link_id)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+
+        raw_id = item.get("id")
+        row_id = int(raw_id) if raw_id is not None else None
+        raw_desc = item.get("turn_desc") or item.get("description")
+        description = str(raw_desc).strip() if raw_desc is not None else None
+        if description == "":
+            description = None
+
+        normalized.append(
+            (row_id, prev_link_id, next_link_id, turn_type, description)
+        )
+
+    return normalized
+
+
 def _seed_turn_type_dictionary(conn: sqlite3.Connection) -> None:
     turn_type_codes = [
         ("001", "비보호회전"),
@@ -132,6 +170,7 @@ def build_sqlite(
     db_path: Path,
     node_rows: list[tuple[int, str | None, float, float]],
     link_rows: list[tuple[int, int, int, float, str]],
+    turninfo_rows: list[tuple[int | None, int, int, str, str | None]],
 ) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     if db_path.exists():
@@ -166,19 +205,36 @@ def build_sqlite(
             """
         )
 
-                conn.execute(
-                        """
-                        CREATE TABLE TB_TURNINFO (
-                            ID INTEGER PRIMARY KEY AUTOINCREMENT,
-                            PREV_LINK_ID INTEGER,
-                            NEXT_LINK_ID INTEGER,
-                            TURN_TYPE TEXT NOT NULL,
-                            TURN_DESC TEXT,
+        conn.execute(
+            """
+            CREATE TABLE TB_TURNINFO (
+              ID INTEGER PRIMARY KEY AUTOINCREMENT,
+              PREV_LINK_ID INTEGER,
+              NEXT_LINK_ID INTEGER,
+              TURN_TYPE TEXT NOT NULL,
+              TURN_DESC TEXT,
               FOREIGN KEY(PREV_LINK_ID) REFERENCES links(id) ON DELETE RESTRICT,
               FOREIGN KEY(NEXT_LINK_ID) REFERENCES links(id) ON DELETE RESTRICT
+            )
+            """
+        )
+
+        conn.executemany(
+            "INSERT INTO nodes (id, name, latitude, longitude) VALUES (?, ?, ?, ?)",
+            node_rows,
+        )
+
         conn.executemany(
             "INSERT INTO links (id, start_node, end_node, weight, road_name) VALUES (?, ?, ?, ?, ?)",
             link_rows,
+        )
+
+        conn.executemany(
+            """
+            INSERT INTO TB_TURNINFO (ID, PREV_LINK_ID, NEXT_LINK_ID, TURN_TYPE, TURN_DESC)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            turninfo_rows,
         )
 
         conn.execute("CREATE INDEX idx_links_start_node ON links(start_node)")
@@ -198,8 +254,8 @@ def build_sqlite(
 
         _seed_turn_type_dictionary(conn)
 
-        # user_version=3: TB_TURNINFO 테이블 + FK ON DELETE RESTRICT 버전
-        conn.execute("PRAGMA user_version = 3")
+        # user_version=6: 최신 Node/Link/TurnInfo 번들 데이터 반영 버전
+        conn.execute("PRAGMA user_version = 6")
         # WAL 파일 없이 단일 파일로 배포 가능하게 journal_mode=DELETE 설정
         conn.execute("PRAGMA journal_mode = DELETE")
 
@@ -227,11 +283,17 @@ def main() -> int:
     api = args.api_base_url.rstrip("/")
     nodes_url = f"{api}/api/nodes"
     links_url = f"{api}/api/links"
+    turninfos_url = f"{api}/api/turninfos"
 
     nodes = fetch_json(nodes_url)
     links = fetch_json(links_url)
+    turninfos = fetch_json(turninfos_url)
 
-    if not isinstance(nodes, list) or not isinstance(links, list):
+    if (
+        not isinstance(nodes, list)
+        or not isinstance(links, list)
+        or not isinstance(turninfos, list)
+    ):
         raise RuntimeError("Unexpected API response format")
 
     root_dir = Path(__file__).resolve().parents[2]
@@ -240,12 +302,15 @@ def main() -> int:
     node_rows = _normalize_nodes(nodes)
     valid_node_ids = {node_id for (node_id, _, _, _) in node_rows}
     link_rows = _normalize_links(links, valid_node_ids)
+    valid_link_ids = {link_id for (link_id, _, _, _, _) in link_rows}
+    turninfo_rows = _normalize_turninfos(turninfos, valid_link_ids)
 
-    build_sqlite(output_path, node_rows, link_rows)
+    build_sqlite(output_path, node_rows, link_rows, turninfo_rows)
 
     print(f"sqlite_export_ok: {output_path}")
     print(f"nodes: {len(node_rows)}")
     print(f"links: {len(link_rows)}")
+    print(f"turninfos: {len(turninfo_rows)}")
     print("integrity_check: ok")
     return 0
 

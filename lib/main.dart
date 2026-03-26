@@ -10,6 +10,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'core/app_log.dart';
+import 'core/tts_service.dart';
 import 'database_helper.dart';
 import 'navigation/maneuver_models.dart';
 import 'navigation/maneuver_utils.dart';
@@ -58,13 +59,30 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
   // 경로 이탈 재탐색 정책
   // - 현재 위치가 경로에서 threshold(m) 이상 벗어난 상태가
   //   consecutiveHits 회 연속 감지되면 재탐색 후보로 판단한다.
-  static const double _rerouteOffPathThresholdMeters = 20;
+  static const double _rerouteOffPathThresholdMeters = 30;
   static const int _rerouteOffPathConsecutiveHits = 2;
   static const double _rerouteCandidateRadiusMeters = 80;
   static const int _rerouteCandidateLimit = 6;
   static const double _rerouteHeadingToleranceDegrees = 100;
+  static const double _initialHeadingMismatchThresholdDegrees = 70;
   static const double _maneuverHandoffDistanceMeters = 12;
+  static const double _destinationArrivalMeters = 20;
+  static const double _destinationEarlyStopMeters = 30;
   static const Duration _navigationMapRestoreDelay = Duration(seconds: 5);
+  static const Duration _navigationStartConfirmationDelay = Duration(
+    seconds: 2,
+  );
+  static const double _navigationBottomPanelEstimatedHeightPx = 86.0;
+  static const double _navigationMarkerGapAbovePanelPx = 18.0;
+  static const double _navigationFollowZoomDefault = 16.0;
+  static const double _mapRotationSmoothingFactor = 0.18;
+  static const double _visualFollowLerpPerTick = 0.20;
+  static const double _visualFollowMaxStepMetersPerTick = 0.7;
+  static const double _visualFollowStopDistanceMeters = 0.6;
+  static const double _visualSnapTurnThresholdDegrees = 18;
+  static const Duration _visualLocationAnimationTick = Duration(
+    milliseconds: 16,
+  );
   static const double _routeArrowSpacingMeters = 45;
   static const int _maxRouteArrowMarkers = 120;
 
@@ -86,6 +104,12 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
   static const double _stationaryNoiseSpeedCeilingKmh = 6.0;
   static const double _stationaryNoiseMoveThresholdMeters = 3.5;
   static const int _stationaryNoiseConsecutiveHits = 2;
+  static const int _movingConfirmConsecutiveHits = 3;
+  static const double _ttsPreviewFarMeters = 500;
+  static const double _ttsPreviewNearMeters = 150;
+  static const double _ttsNowMeters = 30;
+  static const Duration _ttsMinInterval = Duration(seconds: 2);
+  static const Duration _ttsRerouteCooldown = Duration(seconds: 8);
 
   // 과천 디테크타워 기준 시작점 (필요 시 좌표 미세 조정 가능)
   static const LatLng _gwacheonDTechTower = LatLng(37.4019, 126.9882);
@@ -93,6 +117,7 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
   // 외부 의존성/헬퍼
   final DatabaseHelper _dbHelper = DatabaseHelper();
   late PostgresqlHelper? _pgHelper;
+  final TtsService _ttsService = TtsService();
 
   // 지도/경로/주행 상태
   Map<int, Node> _nodes = {};
@@ -101,8 +126,9 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
   List<Node> _currentPath = [];
   final MapController _mapController = MapController();
   LatLng _currentLocation = _gwacheonDTechTower;
+  LatLng _visualLocation = _gwacheonDTechTower;
   double _mapZoom = 15;
-  double _navigationFollowZoom = 17;
+  double _navigationFollowZoom = _navigationFollowZoomDefault;
   double _preNavigationZoom = 15;
   double _mapRotation = 0;
   double _carHeadingDeg = 0;
@@ -111,6 +137,9 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
   Timer? _timer;
   Timer? _networkTimer;
   Timer? _navigationMapRestoreTimer;
+  Timer? _navigationStartDelayTimer;
+  Timer? _visualLocationTimer;
+  final GlobalKey _navigationBottomPanelKey = GlobalKey();
   StreamSubscription<Position>? _positionSubscription;
   StreamSubscription<Position>? _passivePositionSubscription;
   int _pathIndex = 0;
@@ -118,6 +147,7 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
   bool _isLoading = true;
   bool _isLocating = false;
   bool _usePostgreSQL = false;
+  bool _isStartingNavigation = false;
 
   Node? _currentNode; // 현재 위치의 노드
   Node? _destinationNode; // 목적지 노드
@@ -130,12 +160,23 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
   double _currentSpeedKmh = 0;
   bool _isVehicleMoving = false;
   int _stationaryNoiseHitCount = 0;
+  int _movingConfirmHitCount = 0;
   String _roadSequence = '';
   bool _hasInternet = true;
   bool _hasOfflineTileAssets = false;
   int? _offlineTileMinZoom;
   int? _offlineTileMaxZoom;
   bool _hasGpsFix = false;
+  int _nearestNodeRequestSeq = 0;
+  bool _hasReliableVehicleHeading = false;
+  final Set<String> _spokenManeuverStageKeys = <String>{};
+  int? _currentVoiceManeuverNodeIndex;
+  DateTime? _lastTtsAt;
+  DateTime? _lastRerouteTtsAt;
+  LatLng? _visualLocationAnimationTarget;
+  double? _lastRouteBearingForVisualFollow;
+  double _navigationBottomUiLiftPx = 0;
+  double _navigationBottomPanelHeightPx = 0;
 
   final TextEditingController _searchController = TextEditingController();
 
@@ -145,6 +186,7 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
   @override
   void initState() {
     super.initState();
+    unawaited(_ttsService.initialize());
     unawaited(_detectOfflineTileAssets());
     unawaited(_checkInternetConnectivity());
     _networkTimer = Timer.periodic(
@@ -152,6 +194,100 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
       (_) => unawaited(_checkInternetConnectivity()),
     );
     _loadData();
+  }
+
+  String _formatVoiceDistance(double meters) {
+    if (meters >= 1000) {
+      return '${(meters / 1000).toStringAsFixed(1)}킬로미터';
+    }
+    final rounded = (meters / 10).round() * 10;
+    return '${rounded.clamp(10, 999)}미터';
+  }
+
+  Future<void> _speakNavigation(
+    String text, {
+    bool interrupt = false,
+    Duration? minInterval,
+  }) async {
+    final now = DateTime.now();
+    final interval = minInterval ?? _ttsMinInterval;
+
+    if (!interrupt &&
+        _lastTtsAt != null &&
+        now.difference(_lastTtsAt!) < interval) {
+      return;
+    }
+
+    _lastTtsAt = now;
+    await _ttsService.speak(text, interrupt: interrupt);
+  }
+
+  void _resetManeuverVoiceState() {
+    _spokenManeuverStageKeys.clear();
+    _currentVoiceManeuverNodeIndex = null;
+  }
+
+  Future<void> _announceRerouteIfNeeded() async {
+    final now = DateTime.now();
+    if (_lastRerouteTtsAt != null &&
+        now.difference(_lastRerouteTtsAt!) < _ttsRerouteCooldown) {
+      return;
+    }
+
+    _lastRerouteTtsAt = now;
+    await _speakNavigation('경로를 재탐색합니다.', interrupt: true);
+  }
+
+  Future<void> _announceManeuverByDistance() async {
+    final maneuver = _nextManeuver;
+    if (!_isNavigating || maneuver == null) {
+      _resetManeuverVoiceState();
+      return;
+    }
+
+    if (_currentVoiceManeuverNodeIndex != maneuver.nodeIndex) {
+      _spokenManeuverStageKeys.clear();
+      _currentVoiceManeuverNodeIndex = maneuver.nodeIndex;
+    }
+
+    final distanceMeters = _distanceToManeuverMeters();
+    if (distanceMeters <= 0) return;
+
+    final label = maneuverLabel(maneuver.type);
+    final road = maneuver.roadName;
+
+    Future<void> speakStage(
+      String stage,
+      String text, {
+      bool interrupt = false,
+    }) async {
+      final key = '${maneuver.nodeIndex}:$stage';
+      if (_spokenManeuverStageKeys.contains(key)) {
+        return;
+      }
+      _spokenManeuverStageKeys.add(key);
+      await _speakNavigation(text, interrupt: interrupt);
+    }
+
+    if (distanceMeters <= _ttsNowMeters) {
+      await speakStage('now', '지금 $label 하세요.', interrupt: true);
+      return;
+    }
+
+    if (distanceMeters <= _ttsPreviewNearMeters) {
+      await speakStage(
+        'near',
+        '${_formatVoiceDistance(distanceMeters)} 앞 $label, $road 방면입니다.',
+      );
+      return;
+    }
+
+    if (distanceMeters <= _ttsPreviewFarMeters) {
+      await speakStage(
+        'far',
+        '${_formatVoiceDistance(distanceMeters)} 앞 $label 입니다.',
+      );
+    }
   }
 
   bool get _useOfflineTilesNow =>
@@ -225,12 +361,135 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
   }
 
   void _followLocationOnMap() {
-    if (_isNavigating && _isNavigationMapFollowPaused) return;
-
     final targetZoom = _isNavigating ? _navigationFollowZoom : _mapZoom;
     _mapZoom = targetZoom;
-    _mapController.move(_currentLocation, targetZoom);
+    final followLocation = _routeSnappedUiLocation(_visualLocation);
+    final offset = _navigationFollowOffset();
+    _mapController.move(followLocation, targetZoom, offset: offset);
     _mapController.rotate(_mapRotation);
+  }
+
+  Offset _navigationFollowOffset() {
+    if (!_isNavigating) {
+      return Offset.zero;
+    }
+
+    final panelHeight = _navigationBottomPanelHeightPx > 0
+        ? _navigationBottomPanelHeightPx
+        : _navigationBottomPanelEstimatedHeightPx;
+    final markerLiftFromBottom =
+        10 + _navigationBottomUiLiftPx + panelHeight + _navigationMarkerGapAbovePanelPx;
+
+    // X=0 keeps route on horizontal center line, Y offset places marker above bottom panel.
+    return Offset(0, markerLiftFromBottom);
+  }
+
+  void _updateNavigationBottomPanelMetrics(double bottomUiLift) {
+    final renderObject = _navigationBottomPanelKey.currentContext?.findRenderObject();
+    final panelHeight = renderObject is RenderBox ? renderObject.size.height : 0.0;
+
+    final shouldUpdateLift =
+        (_navigationBottomUiLiftPx - bottomUiLift).abs() > 0.5;
+    final shouldUpdateHeight =
+        panelHeight > 0 && (_navigationBottomPanelHeightPx - panelHeight).abs() > 0.5;
+
+    if (!shouldUpdateLift && !shouldUpdateHeight) {
+      return;
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _navigationBottomUiLiftPx = bottomUiLift;
+      if (panelHeight > 0) {
+        _navigationBottomPanelHeightPx = panelHeight;
+      }
+    });
+  }
+
+  double _smoothRotationDegrees(double current, double target) {
+    final delta = normalizeAngle(target - current);
+    return current + delta * _mapRotationSmoothingFactor;
+  }
+
+  void _setMapRotationSmooth(double targetRotation) {
+    _mapRotation = _smoothRotationDegrees(_mapRotation, targetRotation);
+  }
+
+  void _setMapRotationImmediate(double targetRotation) {
+    _mapRotation = targetRotation;
+  }
+
+  void _setVisualLocationImmediate(LatLng location) {
+    _visualLocationTimer?.cancel();
+    _visualLocationTimer = null;
+    _visualLocationAnimationTarget = null;
+    _visualLocation = location;
+  }
+
+  void _animateVisualLocationTo(LatLng target, {bool immediate = false}) {
+    if (immediate) {
+      _setVisualLocationImmediate(target);
+      if (_isNavigating) {
+        _followLocationOnMap();
+      }
+      return;
+    }
+
+    _visualLocationAnimationTarget = target;
+    if (_visualLocationTimer != null) return;
+
+    _visualLocationTimer = Timer.periodic(_visualLocationAnimationTick, (timer) {
+      final goal = _visualLocationAnimationTarget;
+      if (!mounted || goal == null) {
+        timer.cancel();
+        _visualLocationTimer = null;
+        return;
+      }
+
+      final remainingMeters = const Distance().as(
+        LengthUnit.Meter,
+        _visualLocation,
+        goal,
+      );
+
+      if (remainingMeters <= _visualFollowStopDistanceMeters) {
+        setState(() {
+          _visualLocation = goal;
+        });
+        if (_isNavigating) {
+          _followLocationOnMap();
+        }
+        _visualLocationAnimationTarget = null;
+        timer.cancel();
+        _visualLocationTimer = null;
+        return;
+      }
+
+      final desiredStep =
+          (remainingMeters * _visualFollowLerpPerTick).clamp(
+            0.05,
+            _visualFollowMaxStepMetersPerTick,
+          );
+      final stepT = (desiredStep / remainingMeters).clamp(0.0, 1.0);
+
+      setState(() {
+        _visualLocation = interpolateLatLng(_visualLocation, goal, stepT);
+      });
+      if (_isNavigating) {
+        _followLocationOnMap();
+      }
+    });
+  }
+
+  bool _shouldSnapVisualLocationOnTurn(double routeBearing) {
+    final previousBearing = _lastRouteBearingForVisualFollow;
+    _lastRouteBearingForVisualFollow = routeBearing;
+    if (previousBearing == null) {
+      return false;
+    }
+
+    return bearingDifferenceDegrees(previousBearing, routeBearing) >=
+        _visualSnapTurnThresholdDegrees;
   }
 
   void _scheduleNavigationMapRestore() {
@@ -252,7 +511,8 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
     if (zoom != null) {
       _mapZoom = zoom;
     }
-    _mapController.move(target, _mapZoom);
+    final offset = _navigationFollowOffset();
+    _mapController.move(target, _mapZoom, offset: offset);
   }
 
   LatLng? _parseLatLngInput(String query) {
@@ -308,6 +568,7 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
     }
 
     _maneuvers = result;
+    _resetManeuverVoiceState();
     _updateNextManeuver();
   }
 
@@ -457,6 +718,7 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
         await _pgHelper?.connect();
         final pgNodes = await _pgHelper?.getAllNodes();
         final pgLinks = await _pgHelper?.getAllLinks();
+        final pgTurnInfos = await _pgHelper?.getAllTurnInfos();
 
         if (pgNodes != null && pgLinks != null && pgNodes.isNotEmpty) {
           Node? nearestToDefault;
@@ -469,7 +731,7 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
           setState(() {
             _nodes = pgNodes;
             _links = pgLinks;
-            _turnInfos = [];
+            _turnInfos = pgTurnInfos ?? [];
             _usePostgreSQL = true;
             _currentLocation = _gwacheonDTechTower;
             _currentNode =
@@ -506,6 +768,26 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
   // GPS 포지션을 UI 상태에 반영하고, 가장 가까운 그래프 노드를 업데이트한다.
   Future<void> _updateCurrentLocationFromPosition(Position pos) async {
     final gpsLocation = LatLng(pos.latitude, pos.longitude);
+    final previousLocation = _currentLocation;
+    final movedMeters = const Distance().as(
+      LengthUnit.Meter,
+      previousLocation,
+      gpsLocation,
+    );
+    final speedKmh = pos.speed >= 0 ? pos.speed * 3.6 : 0.0;
+
+    double heading = _carHeadingDeg;
+    bool hasReliableHeading = _hasReliableVehicleHeading;
+    if (pos.heading >= 0 &&
+        pos.heading <= 360 &&
+        (speedKmh >= _speedStartThresholdKmh || movedMeters >= 2.0)) {
+      heading = pos.heading;
+      hasReliableHeading = true;
+    } else if (movedMeters > 1.5) {
+      heading = calculateBearing(previousLocation, gpsLocation);
+      hasReliableHeading = true;
+    }
+
     Node? nearestNode;
     if (_usePostgreSQL && _pgHelper != null) {
       nearestNode = await _pgHelper!.findNearestNode(gpsLocation);
@@ -516,6 +798,9 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
     setState(() {
       _currentLocation = gpsLocation;
       _hasGpsFix = true;
+      _carHeadingDeg = heading;
+      _hasReliableVehicleHeading = hasReliableHeading;
+      _setVisualLocationImmediate(gpsLocation);
       if (nearestNode != null) {
         _currentNode = nearestNode;
       }
@@ -564,6 +849,23 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
       }
     }
     return nearest;
+  }
+
+  Future<void> _updateNearestNodeFromBackend(
+    LatLng gpsLocation,
+    int requestSeq,
+  ) async {
+    if (!_usePostgreSQL || _pgHelper == null) return;
+
+    final nearestNode = await _pgHelper!.findNearestNode(gpsLocation);
+    if (nearestNode == null) return;
+    if (!mounted || !_isNavigating) return;
+    if (requestSeq != _nearestNodeRequestSeq) return;
+    if (_currentNode?.id == nearestNode.id) return;
+
+    setState(() {
+      _currentNode = nearestNode;
+    });
   }
 
   // 현재 위치 버튼 처리:
@@ -747,6 +1049,17 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
     return (segmentIndex: bestSegmentIndex, t: bestT);
   }
 
+  double? _routeBearingForLocation(LatLng location) {
+    if (_currentPath.length < 2) return null;
+
+    final projection = _projectLocationOntoCurrentPath(location);
+    if (projection == null) return null;
+
+    final start = _currentPath[projection.segmentIndex].location;
+    final end = _currentPath[projection.segmentIndex + 1].location;
+    return calculateBearing(start, end);
+  }
+
   // 현재 경로 polyline 전체에 대한 최소 이격거리(미터)
   double _minDistanceToCurrentPathMeters(LatLng location) {
     if (_currentPath.length < 2) return double.infinity;
@@ -839,6 +1152,16 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
     return bestNode ?? candidates.first.node;
   }
 
+  Node? _selectInitialStartNodeForCurrentHeading() {
+    final currentNode = _currentNode;
+    if (currentNode == null) return null;
+    if (_destinationNode == null) return currentNode;
+    if (!_hasReliableVehicleHeading) return currentNode;
+
+    return _selectRerouteStartNode(_currentLocation, _carHeadingDeg) ??
+        currentNode;
+  }
+
   // 현재 위치를 기준으로 앞으로 남은 경로만 반환한다.
   // 내비게이션 중이 아닐 때는 전체 경로를 그대로 반환한다.
   List<LatLng> _remainingPathPointsFromLocation(LatLng location) {
@@ -878,6 +1201,25 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
       remaining.add(_currentPath[i].location);
     }
     return remaining;
+  }
+
+  // UI 표시용 차량 좌표를 경로선 위로 스냅한다.
+  // 경로 계산/재탐색 등 내부 로직은 GPS 원좌표(_currentLocation)를 그대로 사용한다.
+  LatLng _routeSnappedUiLocation(LatLng location) {
+    if (!_isNavigating || _currentPath.length < 2) {
+      return location;
+    }
+
+    final projection = _projectLocationOntoCurrentPath(location);
+    if (projection == null) {
+      return location;
+    }
+
+    return interpolateLatLng(
+      _currentPath[projection.segmentIndex].location,
+      _currentPath[projection.segmentIndex + 1].location,
+      projection.t,
+    );
   }
 
   // 현재 위치를 기준으로 경로 상 남은 누적 거리(미터)
@@ -921,6 +1263,35 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
     return remainingMeters / metersPerMinute;
   }
 
+  // 기본 도착 반경(20m) 밖이라도,
+  // 도착지 30m 이내 + 마지막 진입 전에 방향전환이 남아있으면 조기 종료를 허용한다.
+  bool _canCompleteBeforeFinalTurn(LatLng location) {
+    if (_destinationNode == null || _currentPath.length < 3) return false;
+    final next = _nextManeuver;
+    if (next == null) return false;
+
+    final distanceToDestination = const Distance().as(
+      LengthUnit.Meter,
+      location,
+      _destinationNode!.location,
+    );
+    if (distanceToDestination > _destinationEarlyStopMeters) {
+      return false;
+    }
+
+    // 마지막 링크(도착지 진입) 직전의 회전만 조기 종료 대상이다.
+    final finalTurnNodeIndex = _currentPath.length - 2;
+    if (next.nodeIndex != finalTurnNodeIndex) {
+      return false;
+    }
+
+    final projection = _projectLocationOntoCurrentPath(location);
+    if (projection == null) return false;
+
+    // 회전 노드를 지나 실제로 방향전환이 발생한 뒤에는 조기 종료하지 않는다.
+    return projection.segmentIndex < next.nodeIndex;
+  }
+
   // GPS 정차 노이즈(약 1~3km/h)를 줄이기 위한 히스테리시스 필터.
   double _normalizeGpsSpeedKmh(double rawSpeedKmh, double movedMeters) {
     final clamped = rawSpeedKmh.clamp(0, 160).toDouble();
@@ -930,26 +1301,38 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
         movedMeters <= _stationaryNoiseMoveThresholdMeters;
     if (looksStationaryNoise) {
       _stationaryNoiseHitCount += 1;
+      _movingConfirmHitCount = 0;
     } else {
       _stationaryNoiseHitCount = 0;
     }
 
     if (_stationaryNoiseHitCount >= _stationaryNoiseConsecutiveHits) {
       _isVehicleMoving = false;
+      _movingConfirmHitCount = 0;
       return 0;
     }
 
     if (_isVehicleMoving) {
-      if (clamped <= _speedStopThresholdKmh && movedMeters < 4.0) {
+      // 저속 + 짧은 이동은 정차 노이즈로 보고 빠르게 0으로 수렴시킨다.
+      if (clamped <= _stationaryNoiseSpeedCeilingKmh && movedMeters <= 6.0) {
         _isVehicleMoving = false;
+        _movingConfirmHitCount = 0;
         return 0;
       }
       return clamped;
     }
 
-    if (clamped >= _speedStartThresholdKmh ||
-        (clamped >= _speedStopThresholdKmh && movedMeters >= 8.0)) {
+    final strongStart = clamped >= _speedStartThresholdKmh && movedMeters >= 4.0;
+    final weakStart = clamped >= _speedStopThresholdKmh && movedMeters >= 10.0;
+    if (strongStart || weakStart) {
+      _movingConfirmHitCount += 1;
+    } else {
+      _movingConfirmHitCount = 0;
+    }
+
+    if (_movingConfirmHitCount >= _movingConfirmConsecutiveHits) {
       _isVehicleMoving = true;
+      _movingConfirmHitCount = 0;
       return clamped;
     }
 
@@ -974,6 +1357,7 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
             if (_pathIndex >= _currentPath.length - 1) {
               // 마지막 노드 도착
               _currentLocation = _currentPath[_pathIndex].location;
+              _animateVisualLocationTo(_currentLocation);
               _currentSpeedKmh = 0;
               return;
             }
@@ -993,13 +1377,14 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
                   _interpolationProgress;
 
           _currentLocation = LatLng(lat, lng);
+          _animateVisualLocationTo(_currentLocation);
 
           // 이동 방향 계산 및 속도 업데이트
           final heading = calculateBearing(
             currentNode.location,
             nextNode.location,
           );
-          _mapRotation = -heading;
+          _setMapRotationImmediate(-heading);
           _carHeadingDeg = heading;
 
           // 속도 계산 (노드 간 거리 / 예상 시간 1초)
@@ -1021,6 +1406,7 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
           _currentSpeedKmh = 0;
           _isVehicleMoving = false;
           _stationaryNoiseHitCount = 0;
+          _movingConfirmHitCount = 0;
           _nextManeuver = null;
         });
       }
@@ -1044,33 +1430,23 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
         Geolocator.getPositionStream(
           locationSettings: const LocationSettings(
             accuracy: LocationAccuracy.bestForNavigation,
-            distanceFilter: 3,
+            distanceFilter: 1,
           ),
         ).listen(
-          (position) async {
+          (position) {
             if (!mounted || !_isNavigating) return;
 
             final gpsLocation = LatLng(position.latitude, position.longitude);
             final previousLocation = _currentLocation;
+            final requestSeq = ++_nearestNodeRequestSeq;
 
-            Node? nearestNode;
-            if (_usePostgreSQL && _pgHelper != null) {
-              nearestNode = await _pgHelper!.findNearestNode(gpsLocation);
-            }
-            nearestNode ??= _findNearestNodeLocal(gpsLocation);
+            final localNearestNode = _findNearestNodeLocal(gpsLocation);
 
             final movedMeters = const Distance().as(
               LengthUnit.Meter,
               previousLocation,
               gpsLocation,
             );
-
-            double heading = _carHeadingDeg;
-            if (position.heading >= 0) {
-              heading = position.heading;
-            } else if (movedMeters > 1.5) {
-              heading = calculateBearing(previousLocation, gpsLocation);
-            }
 
             final speedKmh = position.speed >= 0
                 ? position.speed * 3.6
@@ -1080,25 +1456,49 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
               movedMeters,
             );
 
+            double heading = _carHeadingDeg;
+            final hasReliableHeadingMovement =
+                movedMeters >= 2.0 ||
+                normalizedSpeedKmh >= _speedStartThresholdKmh;
+            if (hasReliableHeadingMovement &&
+                position.heading >= 0 &&
+                position.heading <= 360) {
+              heading = position.heading;
+            } else if (movedMeters > 1.5) {
+              heading = calculateBearing(previousLocation, gpsLocation);
+            }
+
             final shouldRecalculate = _shouldRecalculateByOffPath(gpsLocation);
             final rerouteStartNode = shouldRecalculate
                 ? _selectRerouteStartNode(gpsLocation, heading)
                 : null;
+            final routeBearing = _routeBearingForLocation(gpsLocation) ?? heading;
+            final snapVisualNow = _shouldSnapVisualLocationOnTurn(routeBearing);
 
             setState(() {
               _currentLocation = gpsLocation;
-              _mapRotation = -heading;
+              _setMapRotationImmediate(-routeBearing);
               _carHeadingDeg = heading;
+              _hasReliableVehicleHeading =
+                  hasReliableHeadingMovement || movedMeters > 1.5;
               _currentSpeedKmh = normalizedSpeedKmh;
               if (rerouteStartNode != null) {
                 _currentNode = rerouteStartNode;
-              } else if (nearestNode != null) {
-                _currentNode = nearestNode;
+              } else if (localNearestNode != null) {
+                _currentNode = localNearestNode;
               }
               _updateNextManeuver();
             });
+            _animateVisualLocationTo(gpsLocation, immediate: snapVisualNow);
+
+            if (rerouteStartNode == null) {
+              unawaited(_updateNearestNodeFromBackend(gpsLocation, requestSeq));
+            }
+
+            unawaited(_announceManeuverByDistance());
 
             if (shouldRecalculate) {
+              unawaited(_announceRerouteIfNeeded());
               _calculatePath();
             }
 
@@ -1111,11 +1511,18 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
                 _destinationNode!.location,
               );
 
-              if (remainMeters <= 20) {
+              final canEarlyComplete = _canCompleteBeforeFinalTurn(gpsLocation);
+              if (remainMeters <= _destinationArrivalMeters || canEarlyComplete) {
+                final arrivalMessage = canEarlyComplete
+                    ? '목적지 인근에 도착했습니다.'
+                    : '목적지에 도착했습니다.';
+                unawaited(
+                  _speakNavigation(arrivalMessage, interrupt: true),
+                );
                 if (mounted) {
                   ScaffoldMessenger.of(
                     context,
-                  ).showSnackBar(const SnackBar(content: Text('목적지에 도착했습니다.')));
+                  ).showSnackBar(SnackBar(content: Text(arrivalMessage)));
                 }
                 _stopNavigation();
               }
@@ -1382,37 +1789,58 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
       return;
     }
 
+    final startNode = _selectInitialStartNodeForCurrentHeading() ?? _currentNode!;
     final engine = NavEngine(_nodes, _links, turnInfos: _turnInfos);
-    final pathInfo = engine.getPathInfo(_currentNode!.id, _destinationNode!.id);
+    final pathInfo = engine.getPathInfo(startNode.id, _destinationNode!.id);
 
     setState(() {
+      _currentNode = startNode;
       _currentPath = pathInfo['path'] as List<Node>;
       _totalDistance = pathInfo['distance'] as double;
       _roadSequence = pathInfo['roads'] as String;
       _pathIndex = 0;
       _interpolationProgress = 0.0;
       _offPathHitCount = 0;
+      if (_isNavigating) {
+        final routeBearing = _routeBearingForLocation(_currentLocation);
+        if (routeBearing != null) {
+          _setMapRotationImmediate(-routeBearing);
+        }
+      }
     });
     _buildManeuversFromPath();
   }
 
-  // 내비게이션 시작:
-  // - UI 상태 전환
-  // - 지도 확대
-  // - GPS 주행 시작
-  void _startNavigation() {
+  void _startNavigationNow() {
     if (_currentPath.isEmpty) return;
+
+    double initialHeading = _carHeadingDeg;
+    initialHeading =
+        _routeBearingForLocation(_currentLocation) ??
+        (_currentPath.length >= 2
+            ? calculateBearing(
+                _currentPath[0].location,
+                _currentPath[1].location,
+              )
+            : initialHeading);
+
     setState(() {
       _isNavigating = true;
+      _isStartingNavigation = false;
       _currentSpeedKmh = 0;
       _isVehicleMoving = false;
       _stationaryNoiseHitCount = 0;
+      _movingConfirmHitCount = 0;
       _isNavigationMapFollowPaused = false;
+      _carHeadingDeg = initialHeading;
+      _setMapRotationImmediate(-initialHeading);
+      _lastRouteBearingForVisualFollow = initialHeading;
     });
 
     _preNavigationZoom = _mapZoom;
-    // zoom +2 는 체감 약 4배 확대다.
-    _navigationFollowZoom = (_mapZoom + 2).clamp(3.0, 20.0);
+    // flutter_map은 3D pitch(틸트)를 직접 지원하지 않으므로,
+    // follow zoom 고정 + 하단 오프셋으로 전방 시야를 넓게 보이게 한다.
+    _navigationFollowZoom = _navigationFollowZoomDefault;
     _mapZoom = _navigationFollowZoom;
     _followLocationOnMap();
 
@@ -1420,8 +1848,65 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
     _interpolationProgress = 0.0;
     _updateNextManeuver();
 
+    unawaited(_speakNavigation('경로 안내를 시작합니다.', interrupt: true));
+
     unawaited(WakelockPlus.enable());
     _startGpsNavigation();
+  }
+
+  // 내비게이션 시작:
+  // - 시작 헤딩과 첫 링크 방향이 크게 다르면 잠시 확인 후 시작
+  // - UI 상태 전환
+  // - 지도 확대
+  // - GPS 주행 시작
+  void _startNavigation() {
+    if (_currentPath.isEmpty || _isNavigating || _isStartingNavigation) {
+      return;
+    }
+
+    _calculatePath();
+    if (_currentPath.isEmpty) return;
+
+    if (_hasReliableVehicleHeading && _currentPath.length >= 2) {
+      final firstSegmentBearing = calculateBearing(
+        _currentPath[0].location,
+        _currentPath[1].location,
+      );
+      final headingDiff = bearingDifferenceDegrees(
+        _carHeadingDeg,
+        firstSegmentBearing,
+      );
+
+      if (headingDiff >= _initialHeadingMismatchThresholdDegrees) {
+        setState(() {
+          _isStartingNavigation = true;
+        });
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('출발 방향 확인 중...')),
+          );
+        }
+
+        _navigationStartDelayTimer?.cancel();
+        _navigationStartDelayTimer = Timer(
+          _navigationStartConfirmationDelay,
+          () {
+            if (!mounted || _isNavigating) return;
+            _calculatePath();
+            if (_currentPath.isEmpty) {
+              setState(() {
+                _isStartingNavigation = false;
+              });
+              return;
+            }
+            _startNavigationNow();
+          },
+        );
+        return;
+      }
+    }
+
+    _startNavigationNow();
   }
 
   void _clearRoutePreview() {
@@ -1439,24 +1924,33 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
     _timer?.cancel();
     _positionSubscription?.cancel();
     _navigationMapRestoreTimer?.cancel();
+    _navigationStartDelayTimer?.cancel();
+    _visualLocationTimer?.cancel();
+    unawaited(_ttsService.stop());
     unawaited(WakelockPlus.disable());
     setState(() {
       _isNavigating = false;
+      _isStartingNavigation = false;
       _currentSpeedKmh = 0;
       _isVehicleMoving = false;
       _stationaryNoiseHitCount = 0;
+      _movingConfirmHitCount = 0;
       _isNavigationMapFollowPaused = false;
       _mapRotation = 0;
       _carHeadingDeg = 0;
+      _hasReliableVehicleHeading = false;
+      _lastRouteBearingForVisualFollow = null;
       _mapZoom = _preNavigationZoom;
       _offPathHitCount = 0;
+      _setVisualLocationImmediate(_currentLocation);
       _clearRoutePreview();
     });
+    _resetManeuverVoiceState();
     _followLocationOnMap();
   }
 
   void _toggleNavigation() {
-    if (_isNavigating) {
+    if (_isNavigating || _isStartingNavigation) {
       _stopNavigation();
       return;
     }
@@ -1468,8 +1962,11 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
     _timer?.cancel();
     _networkTimer?.cancel();
     _navigationMapRestoreTimer?.cancel();
+    _navigationStartDelayTimer?.cancel();
+    _visualLocationTimer?.cancel();
     _positionSubscription?.cancel();
     _passivePositionSubscription?.cancel();
+    unawaited(_ttsService.dispose());
     unawaited(WakelockPlus.disable());
     _searchController.dispose();
     _pgHelper?.disconnect();
@@ -1524,22 +2021,30 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
       );
     }
 
-    final renderedPathPoints = _remainingPathPointsFromLocation(
-      _currentLocation,
-    );
+    final uiCarLocation = _routeSnappedUiLocation(_visualLocation);
+    final renderedPathPoints = _remainingPathPointsFromLocation(uiCarLocation);
     final routeArrowMarkers = buildRouteArrowMarkers(
       points: renderedPathPoints,
       spacingMeters: _routeArrowSpacingMeters,
       maxMarkers: _maxRouteArrowMarkers,
     );
     final remainingDistanceMeters = _remainingDistanceMetersFromLocation(
-      _currentLocation,
+      uiCarLocation,
     );
     final remainingEtaMinutes = _remainingEtaMinutesFromDistance(
       remainingDistanceMeters,
     );
+    final markerHeadingDeg = _isNavigating
+      ? (_routeBearingForLocation(_currentLocation) ?? _carHeadingDeg)
+      : _carHeadingDeg;
     final mediaQuery = MediaQuery.of(context);
     final bottomUiLift = mediaQuery.viewPadding.bottom + 12;
+
+    if (_isNavigating) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _updateNavigationBottomPanelMetrics(bottomUiLift);
+      });
+    }
 
     return Scaffold(
       appBar: AppBar(title: const Text('경로 네비게이션'), elevation: 0),
@@ -1550,23 +2055,15 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
           FlutterMap(
             mapController: _mapController,
             options: MapOptions(
-              initialCenter: _currentLocation,
+              initialCenter: _visualLocation,
               initialZoom: _mapZoom,
               initialRotation: _mapRotation,
               onPositionChanged: (position, hasGesture) {
                 final nextZoom = position.zoom ?? _mapZoom;
                 if (_isNavigating) {
-                  if (hasGesture) {
-                    setState(() {
-                      _mapZoom = nextZoom;
-                    });
-                    _scheduleNavigationMapRestore();
-                    return;
-                  }
-
-                  if (!_isNavigationMapFollowPaused) {
-                    _mapZoom = _navigationFollowZoom;
-                  }
+                  // 내비 중에는 항상 follow를 유지해 마커/경로를 화면 기준 중앙 정렬로 고정한다.
+                  _isNavigationMapFollowPaused = false;
+                  _mapZoom = _navigationFollowZoom;
                   return;
                 }
 
@@ -1614,12 +2111,12 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
               MarkerLayer(
                 markers: [
                   Marker(
-                    point: _currentLocation,
-                    width: 44,
-                    height: 44,
+                    point: uiCarLocation,
+                    width: 52,
+                    height: 52,
                     child: TweenAnimationBuilder<double>(
-                      duration: const Duration(milliseconds: 280),
-                      tween: Tween<double>(begin: 0, end: _carHeadingDeg),
+                      duration: const Duration(milliseconds: 140),
+                      tween: Tween<double>(begin: 0, end: markerHeadingDeg),
                       builder: (context, angleDeg, child) {
                         // 차량 아이콘이 실제 이동 경로의 각도를 바라보도록 heading만 적용.
                         final combinedAngle = angleDeg * math.pi / 180;
@@ -1629,9 +2126,9 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
                         );
                       },
                       child: Image.asset(
-                        'assets/images/car_icon.png',
-                        width: 44,
-                        height: 44,
+                        'assets/images/arrow_icon.png',
+                        width: 52,
+                        height: 52,
                         fit: BoxFit.contain,
                       ),
                     ),
@@ -1639,12 +2136,12 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
                   if (_destinationNode != null)
                     Marker(
                       point: _destinationNode!.location,
-                      width: 40,
-                      height: 40,
+                      width: 64,
+                      height: 64,
                       child: const Icon(
                         Icons.location_on,
                         color: Colors.green,
-                        size: 40,
+                        size: 64,
                       ),
                     ),
                 ],
@@ -1957,10 +2454,13 @@ class _LocalNavScreenState extends State<LocalNavScreen> {
               bottom: 10 + bottomUiLift,
               left: 10,
               right: 10,
-              child: NavigationBottomPanel(
-                remainingDistanceMeters: remainingDistanceMeters,
-                remainingEtaMinutes: remainingEtaMinutes,
-                onStop: _stopNavigation,
+              child: KeyedSubtree(
+                key: _navigationBottomPanelKey,
+                child: NavigationBottomPanel(
+                  remainingDistanceMeters: remainingDistanceMeters,
+                  remainingEtaMinutes: remainingEtaMinutes,
+                  onStop: _stopNavigation,
+                ),
               ),
             ),
         ],

@@ -105,6 +105,30 @@ class PostgresqlHelper {
     }
   }
 
+  // 회전 제약 전이 정보 조회
+  Future<List<TurnInfo>> getAllTurnInfos() async {
+    try {
+      final response = await _httpClient
+          .get(Uri.parse('$baseUrl/api/turninfos'))
+          .timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200) {
+        final List<dynamic> data = jsonDecode(response.body);
+        return data
+            .map(
+              (item) => TurnInfo.fromMap(item as Map<String, dynamic>),
+            )
+            .where((item) => item.turnType.isNotEmpty && item.hasTransition)
+            .toList();
+      }
+
+      throw Exception('회전정보 로드 실패: ${response.statusCode}');
+    } catch (e) {
+      appLog('회전정보 조회 실패: $e');
+      return [];
+    }
+  }
+
   // 노드 검색 (이름이나 ID로)
   Future<List<Node>> searchNodes(String query) async {
     try {
